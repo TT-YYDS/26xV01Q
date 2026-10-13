@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <style>
+    html, body, #plot {width:100%;height:100%;margin:0;overflow:hidden;background:#fff;}
+    * {box-sizing:border-box;}
+  </style>
+  <script src="plotly.min.js"></script>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body><div id="plot"></div>
+<script>
+const plot = document.getElementById("plot");
+let bridge, current = -1, mode = "", queue = Promise.resolve();
+function send(event) {
+  if (bridge) bridge.event(JSON.stringify({...event, generation:current, mode}));
+}
+window.renderFile = function(file, generation, nextMode) {
+  current = generation;
+  mode = "";
+  queue = queue.catch(() => {}).then(async () => {
+    if (generation !== current) return;
+    const response = await fetch(file);
+    if (!response.ok) throw new Error("Cannot read figure");
+    const figure = await response.json();
+    if (generation !== current) return;
+    // Selection rectangles are interaction state, not part of the next view.
+    figure.layout = {...(figure.layout || {}),
+      selections: nextMode === "region" ? (figure.layout.selections || []) : []};
+    await Plotly.react(plot, figure.data, figure.layout, {
+      responsive:true, displaylogo:false, scrollZoom:true,
+      modeBarButtonsToRemove:["lasso2d", "select2d", "toImage"]
+    });
+    if (generation !== current) return;
+    mode = nextMode;
+    plot.removeAllListeners("plotly_selected");
+    plot.removeAllListeners("plotly_relayout");
+    plot.removeAllListeners("plotly_click");
+    plot.on("plotly_selected", e => {
+      if (mode === "region" && e && e.range) {
+        send({type:"region", bounds:[...e.range.x, ...e.range.y]});
+      }
+    });
+    plot.on("plotly_relayout", e => {
+      if (mode !== "region" || !e ||
+          !Object.keys(e).some(key => key === "selections" || key.startsWith("selections["))) return;
+      const selection = (plot.layout.selections || [])[0];
+      if (selection && selection.x0 !== undefined && selection.x1 !== undefined &&
+          selection.y0 !== undefined && selection.y1 !== undefined) {
+        send({type:"region", bounds:[
+          Math.min(selection.x0, selection.x1), Math.max(selection.x0, selection.x1),
+          Math.min(selection.y0, selection.y1), Math.max(selection.y0, selection.y1)
+        ]});
+      }
+    });
+    plot.on("plotly_click", e => {
+      if (mode === "cad" && e && e.points && e.points.length) {
+        const p = e.points[0];
+        const id = Array.isArray(p.customdata) ? p.customdata[0] : p.customdata;
+        if (Number.isInteger(id)) send({type:"cad", entity:id});
+      }
+    });
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (generation === current) send({type:"rendered"});
+    }));
+  }).catch(error => send({type:"error", message:String(error)}));
+};
+new QWebChannel(qt.webChannelTransport, channel => {
+  bridge = channel.objects.desktop;
+  bridge.ready();
+});
+let resize;
+new ResizeObserver(() => {
+  clearTimeout(resize);
+  resize = setTimeout(() => { if (plot.data) Plotly.Plots.resize(plot); }, 80);
+}).observe(document.body);
+</script></body></html>
